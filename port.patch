@@ -1,0 +1,2085 @@
+diff --git "a/source/blender/blenkernel/BKE_node_legacy_types.hh" "b/source/blender/blenkernel/BKE_node_legacy_types.hh"
+index c8ec7f2..084996c 100644
+--- "a/source/blender/blenkernel/BKE_node_legacy_types.hh"
++++ "b/source/blender/blenkernel/BKE_node_legacy_types.hh"
+@@ -297,6 +297,7 @@
+ #define CMP_NODE_SEPARATE_COLOR 333
+ #define CMP_NODE_IMAGE_INFO 334
+ #define CMP_NODE_CONVERT_TO_DISPLAY 335
++#define CMP_NODE_NEURAL 336
+ 
+ /* channel toggles */
+ #define CMP_CHAN_RGB 1
+diff --git "a/source/blender/compositor/CMakeLists.txt" "b/source/blender/compositor/CMakeLists.txt"
+index 2129548..f60fef4 100644
+--- "a/source/blender/compositor/CMakeLists.txt"
++++ "b/source/blender/compositor/CMakeLists.txt"
+@@ -149,8 +149,10 @@ set(SRC
+   derived_resources/COM_denoised_auxiliary_pass.hh
+ 
+   utilities/intern/oidn.cc
++  utilities/intern/dlssnr.cc
+ 
+   utilities/COM_utilities_diagonals.hh
++  utilities/COM_utilities_dlssnr.hh
+   utilities/COM_utilities_oidn.hh
+ )
+ 
+@@ -159,6 +161,7 @@ set(LIB
+   PRIVATE bf::blenkernel
+   PRIVATE bf::blentranslation
+   PRIVATE bf::functions
++  PRIVATE bf::ghost
+   PRIVATE bf::gpu
+   PRIVATE bf::imbuf
+   PRIVATE bf::nodes
+diff --git "a/source/blender/compositor/COM_context.hh" "b/source/blender/compositor/COM_context.hh"
+index 9c0b406..3d50126 100644
+--- "a/source/blender/compositor/COM_context.hh"
++++ "b/source/blender/compositor/COM_context.hh"
+@@ -112,6 +112,16 @@ class Context {
+    * executing as soon as possible. */
+   virtual bool is_canceled() const;
+ 
++  /* Returns true if the compositor is evaluating within a viewport. Temporal effects like the
++   * DLSS neural rendering pass must not unbind the drawing context in that case. */
++  virtual bool is_viewport() const;
++
++  /* Get a key that identifies the current temporal composition context, used to determine whether
++   * the history of temporal effects like the DLSS neural rendering pass is still valid. The key
++   * should change whenever the composition changes in a way that invalidates temporal history,
++   * like a change of frame or camera. */
++  virtual uint64_t temporal_view_key() const;
++
+   /* Get the normalized render percentage of the active scene. */
+   float get_render_percentage() const;
+ 
+diff --git "a/source/blender/compositor/COM_result.hh" "b/source/blender/compositor/COM_result.hh"
+index 9558db6..e3a8db6 100644
+--- "a/source/blender/compositor/COM_result.hh"
++++ "b/source/blender/compositor/COM_result.hh"
+@@ -365,6 +365,10 @@ class Result {
+   /* Returns true if the result is allocated. */
+   bool is_allocated() const;
+ 
++  /* Returns true if the allocated data is stored as a GPU texture, and false if it is
++   * host-accessible CPU data. */
++  bool is_stored_on_gpu() const;
++
+   /* Returns the reference count of the result. */
+   int reference_count() const;
+ 
+diff --git "a/source/blender/compositor/intern/context.cc" "b/source/blender/compositor/intern/context.cc"
+index 806f063..9f2cbb2 100644
+--- "a/source/blender/compositor/intern/context.cc"
++++ "b/source/blender/compositor/intern/context.cc"
+@@ -4,6 +4,8 @@
+ 
+ #include "DNA_node_types.h"
+ 
++#include "BLI_hash.hh"
++
+ #include "GPU_shader.hh"
+ 
+ #include "COM_context.hh"
+@@ -67,6 +69,17 @@ bool Context::is_canceled() const
+   return false;
+ }
+ 
++bool Context::is_viewport() const
++{
++  return false;
++}
++
++uint64_t Context::temporal_view_key() const
++{
++  const Domain domain = this->get_compositing_domain();
++  return get_default_hash(this->get_frame_number(), domain.data_size.x, domain.data_size.y);
++}
++
+ float Context::get_render_percentage() const
+ {
+   return get_render_data().size / 100.0f;
+diff --git "a/source/blender/compositor/intern/result.cc" "b/source/blender/compositor/intern/result.cc"
+index be431d7..4bee5a9 100644
+--- "a/source/blender/compositor/intern/result.cc"
++++ "b/source/blender/compositor/intern/result.cc"
+@@ -970,6 +970,11 @@ bool Result::is_allocated() const
+   return false;
+ }
+ 
++bool Result::is_stored_on_gpu() const
++{
++  return storage_type_ == ResultStorageType::GPU && gpu_texture_ != nullptr;
++}
++
+ int Result::reference_count() const
+ {
+   return reference_count_;
+diff --git "a/source/blender/compositor/utilities/COM_utilities_dlssnr.hh" "b/source/blender/compositor/utilities/COM_utilities_dlssnr.hh"
+new file mode 100644
+index 0000000..5722236
+--- /dev/null
++++ "b/source/blender/compositor/utilities/COM_utilities_dlssnr.hh"
+@@ -0,0 +1,45 @@
++/* SPDX-FileCopyrightText: 2026 Blender Authors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later */
++
++#pragma once
++
++#include <cstdint>
++
++#include "COM_context.hh"
++#include "COM_result.hh"
++
++namespace blender::compositor {
++
++/* True when nvngx_dlssnr.dll is present and an NVIDIA D3D12 adapter exists. */
++bool is_dlssnr_available();
++
++/* Last failure, valid until the next probe/apply. Never null. */
++const char *dlssnr_last_error();
++
++struct DLSSNRParams {
++  float intensity = 1.0f;
++  float structure = 1.0f;
++  float tone = 1.0f;
++  float skin = -1.0f;
++  int style = 2;
++  bool reset = false;
++  uint64_t view_key = 0;
++  bool auto_mask = false;
++  bool ui_correction = false;
++  bool clamp_input = true;
++};
++
++/* Neural appearance pass. Color must already be a CPU image. Optional guides may be null or
++ * single-value. Output is allocated as a CPU Color image at the input resolution. */
++bool apply_dlssnr(Context &context,
++                  const Result &color,
++                  const Result *depth,
++                  const Result *motion,
++                  const Result *mask,
++                  const Result *albedo,
++                  const Result *normal,
++                  const DLSSNRParams &params,
++                  Result &output);
++
++}  // namespace blender::compositor
+diff --git "a/source/blender/compositor/utilities/intern/dlssnr.cc" "b/source/blender/compositor/utilities/intern/dlssnr.cc"
+new file mode 100644
+index 0000000..8389ed3
+--- /dev/null
++++ "b/source/blender/compositor/utilities/intern/dlssnr.cc"
+@@ -0,0 +1,1558 @@
++/* SPDX-FileCopyrightText: 2026 Blender Authors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later */
++
++#include "COM_utilities_dlssnr.hh"
++
++#ifndef _WIN32
++
++namespace blender::compositor {
++
++bool is_dlssnr_available()
++{
++  return false;
++}
++
++const char *dlssnr_last_error()
++{
++  return "DLSSNR is only available on Windows D3D12";
++}
++
++bool apply_dlssnr(Context & /*context*/,
++                  const Result & /*color*/,
++                  const Result * /*depth*/,
++                  const Result * /*motion*/,
++                  const Result * /*mask*/,
++                  const Result * /*albedo*/,
++                  const Result * /*normal*/,
++                  const DLSSNRParams & /*params*/,
++                  Result & /*output*/)
++{
++  return false;
++}
++
++}  // namespace blender::compositor
++
++#else
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <mutex>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "BKE_appdir.hh"
++
++#include "BLI_math_vector_types.hh"
++#include "BLI_string.hh"
++#include "BLI_string_utf8.hh"
++
++#include "CLG_log.h"
++
++#include "GPU_context.hh"
++
++#include "GHOST_IContext.hh"
++
++#define WIN32_LEAN_AND_MEAN
++#define NOMINMAX
++#include <Windows.h>
++#include <d3d12.h>
++#include <dxgi1_6.h>
++#include <wrl/client.h>
++
++static CLG_LogRef LOG = {"compositor.dlssnr"};
++
++namespace blender::compositor {
++
++static char g_last_error[512] = "nvngx_dlssnr.dll not found (place in blender/dlss5/)";
++
++static void set_nr_error(const char *msg)
++{
++  BLI_strncpy(g_last_error, msg ? msg : "", sizeof(g_last_error));
++  CLOG_ERROR(&LOG, "%s", g_last_error);
++}
++
++static std::wstring utf8_to_wstring(const char *src)
++{
++  wchar_t dst[1024];
++  BLI_strncpy_wchar_from_utf8(dst, src ? src : "", 1024);
++  return std::wstring(dst);
++}
++
++static uint16_t float_to_half(const float value)
++{
++  uint32_t bits = 0;
++  memcpy(&bits, &value, sizeof(bits));
++  const uint32_t sign = (bits >> 16) & 0x8000u;
++  const int32_t exponent = int32_t((bits >> 23) & 0xFFu) - 127 + 15;
++  uint32_t mantissa = bits & 0x7FFFFFu;
++  if (exponent <= 0) {
++    if (exponent < -10) {
++      return uint16_t(sign);
++    }
++    mantissa = (mantissa | 0x800000u) >> (1 - exponent);
++    return uint16_t(sign | ((mantissa + 0x1000u) >> 13));
++  }
++  if (exponent >= 31) {
++    return uint16_t(sign | 0x7C00u);
++  }
++  return uint16_t(sign | (uint32_t(exponent) << 10) | ((mantissa + 0x1000u) >> 13));
++}
++
++static float half_to_float(const uint16_t value)
++{
++  const uint32_t sign = uint32_t(value & 0x8000u) << 16;
++  uint32_t exponent = (value >> 10) & 0x1Fu;
++  uint32_t mantissa = value & 0x3FFu;
++  uint32_t bits = 0;
++  if (exponent == 0) {
++    if (mantissa != 0) {
++      exponent = 127 - 15 + 1;
++      while ((mantissa & 0x400u) == 0) {
++        mantissa <<= 1;
++        exponent--;
++      }
++      mantissa &= 0x3FFu;
++      bits = sign | (exponent << 23) | (mantissa << 13);
++    }
++  }
++  else if (exponent == 31) {
++    bits = sign | 0x7F800000u | (mantissa << 13);
++  }
++  else {
++    bits = sign | ((exponent + 127 - 15) << 23) | (mantissa << 13);
++  }
++  float out = 0.0f;
++  memcpy(&out, &bits, sizeof(out));
++  return out;
++}
++
++static constexpr unsigned long long kAppIdUnity = 0x0876232Cull;
++static constexpr unsigned long long kAppIdPhoenix = 141959980ull;
++static constexpr int kSdkSnippet = 0x15;
++static constexpr int kFeatureId = 18;
++static constexpr int kEngineTypeUnity = 2;
++static constexpr int kNgxSuccess = 0x1;
++
++using Microsoft::WRL::ComPtr;
++
++struct NVSDK_NGX_Parameter;
++struct NVSDK_NGX_Handle;using NgxResult = int;
++using GetModuleFileNameWFn = DWORD(WINAPI *)(HMODULE, LPWSTR, DWORD);
++using NgxInitProjectFn = NgxResult(__cdecl *)(const char *,
++                                              int,
++                                              const char *,
++                                              const wchar_t *,
++                                              ID3D12Device *,
++                                              const NVSDK_NGX_FeatureCommonInfo *,
++                                              int);
++using NgxInitProjectLegacyFn = NgxResult(__cdecl *)(const char *,
++                                                    int,
++                                                    const char *,
++                                                    const wchar_t *,
++                                                    ID3D12Device *,
++                                                    int,
++                                                    const NVSDK_NGX_FeatureCommonInfo *);
++using NgxInitExtCoreFn = NgxResult(__cdecl *)(unsigned long long,
++                                              const wchar_t *,
++                                              ID3D12Device *,
++                                              int,
++                                              const NVSDK_NGX_FeatureCommonInfo *);
++using NgxInitExtSnippetFn = NgxResult(__cdecl *)(unsigned long long,
++                                                 const wchar_t *,
++                                                 ID3D12Device *,
++                                                 const NVSDK_NGX_FeatureCommonInfo *,
++                                                 int);
++using NgxShutdownFn = NgxResult(__cdecl *)(ID3D12Device *);
++using NgxAllocFn = NgxResult(__cdecl *)(NVSDK_NGX_Parameter **);
++using NgxDestroyPFn = NgxResult(__cdecl *)(NVSDK_NGX_Parameter *);
++using NgxCreateFn = NgxResult(__cdecl *)(ID3D12GraphicsCommandList *,
++                                         int,
++                                         NVSDK_NGX_Parameter *,
++                                         NVSDK_NGX_Handle **);
++using NgxEvalFn = NgxResult(__cdecl *)(ID3D12GraphicsCommandList *,
++                                       const NVSDK_NGX_Handle *,
++                                       const NVSDK_NGX_Parameter *,
++                                       void *);
++using NgxReleaseFn = NgxResult(__cdecl *)(NVSDK_NGX_Handle *);
++
++struct NgxPathListInfo {
++  const wchar_t *const *path;
++  unsigned int length;
++};
++struct NgxLoggingInfo {
++  void(__cdecl *callback)(const char *, int, int);
++  int minimum;
++  bool disable_other_sinks;
++};
++struct NVSDK_NGX_FeatureCommonInfo {
++  NgxPathListInfo PathListInfo;
++  void *internal_data;
++  NgxLoggingInfo LoggingInfo;
++};
++
++static HMODULE g_hooked_snippet = nullptr;
++static HMODULE g_hooked_core = nullptr;
++static GetModuleFileNameWFn g_original_get_module = nullptr;
++static volatile LONG g_post_call_sink = 0;
++
++static bool write_iat(void **slot, void *value)
++{
++  DWORD old_protect = 0;
++  if (slot == nullptr || !VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &old_protect)) {
++    return false;
++  }
++  InterlockedExchangePointer(slot, value);
++  DWORD ignored = 0;
++  VirtualProtect(slot, sizeof(void *), old_protect, &ignored);
++  FlushInstructionCache(GetCurrentProcess(), slot, sizeof(void *));
++  return true;
++}
++
++static DWORD WINAPI hooked_get_module_file_name_w(HMODULE module, LPWSTR filename, DWORD size)
++{
++  if (g_original_get_module == nullptr) {
++    return 0;
++  }
++  if (g_hooked_snippet != nullptr && module == g_hooked_snippet) {
++    return g_original_get_module(module, filename, size);
++  }
++  if (g_hooked_core != nullptr && module == g_hooked_core) {
++    return g_original_get_module(module, filename, size);
++  }
++  if (filename == nullptr || size == 0) {
++    return 0;
++  }
++  constexpr wchar_t fake_name[] = L"nvngx.dll";
++  constexpr DWORD fake_length = ARRAYSIZE(fake_name) - 1;
++  if (fake_length + 1 > size) {
++    SetLastError(ERROR_INSUFFICIENT_BUFFER);
++    return size;
++  }
++  memcpy(filename, fake_name, sizeof(fake_name));
++  return fake_length;
++}
++
++static bool hook_snippet_get_module_file_name(HMODULE snippet, HMODULE core, void ***r_iat_slot)
++{
++  if (snippet == nullptr || r_iat_slot == nullptr) {
++    return false;
++  }
++  BYTE *base = reinterpret_cast<BYTE *>(snippet);
++  IMAGE_DOS_HEADER *dos = reinterpret_cast<IMAGE_DOS_HEADER *>(base);
++  if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
++    return false;
++  }
++  IMAGE_NT_HEADERS *nt = reinterpret_cast<IMAGE_NT_HEADERS *>(base + dos->e_lfanew);
++  if (nt->Signature != IMAGE_NT_SIGNATURE) {
++    return false;
++  }
++  const auto &directory = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
++  if (directory.VirtualAddress == 0) {
++    return false;
++  }
++  HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
++  const FARPROC wanted = kernel32 ? GetProcAddress(kernel32, "GetModuleFileNameW") : nullptr;
++  IMAGE_IMPORT_DESCRIPTOR *descriptor = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR *>(
++      base + directory.VirtualAddress);
++  for (; descriptor->Name != 0; ++descriptor) {
++    const char *name = reinterpret_cast<const char *>(base + descriptor->Name);
++    if (_stricmp(name, "KERNEL32.dll") != 0 && _stricmp(name, "KERNELBASE.dll") != 0) {
++      continue;
++    }
++    IMAGE_THUNK_DATA *slots = reinterpret_cast<IMAGE_THUNK_DATA *>(base + descriptor->FirstThunk);
++    IMAGE_THUNK_DATA *imports = descriptor->OriginalFirstThunk ?
++                                    reinterpret_cast<IMAGE_THUNK_DATA *>(base +
++                                                                          descriptor->OriginalFirstThunk) :
++                                    nullptr;
++    for (size_t index = 0; slots[index].u1.Function != 0; ++index) {
++      bool match = false;
++      if (imports != nullptr && imports[index].u1.AddressOfData != 0 &&
++          !IMAGE_SNAP_BY_ORDINAL(imports[index].u1.Ordinal))
++      {
++        IMAGE_IMPORT_BY_NAME *entry = reinterpret_cast<IMAGE_IMPORT_BY_NAME *>(
++            base + imports[index].u1.AddressOfData);
++        match = strcmp(reinterpret_cast<const char *>(entry->Name), "GetModuleFileNameW") == 0;
++      }
++      else if (wanted && slots[index].u1.Function == reinterpret_cast<ULONG_PTR>(wanted)) {
++        match = true;
++      }
++      if (!match) {
++        continue;
++      }
++      void **slot = reinterpret_cast<void **>(&slots[index].u1.Function);
++      g_original_get_module = reinterpret_cast<GetModuleFileNameWFn>(*slot);
++      g_hooked_snippet = snippet;
++      g_hooked_core = core;
++      if (!write_iat(slot, reinterpret_cast<void *>(&hooked_get_module_file_name_w))) {
++        g_original_get_module = nullptr;
++        g_hooked_snippet = nullptr;
++        g_hooked_core = nullptr;
++        return false;
++      }
++      *r_iat_slot = slot;
++      return true;
++    }
++  }
++  return false;
++}
++
++static __declspec(noinline) NgxResult finish_call(NgxResult result)
++{
++  g_post_call_sink = LONG(result);
++  return result;
++}
++
++static __declspec(noinline) NgxResult call_snippet_init(NgxInitExtSnippetFn fn,
++                                                        unsigned long long app_id,
++                                                        const wchar_t *path,
++                                                        ID3D12Device *device,
++                                                        const NVSDK_NGX_FeatureCommonInfo *info,
++                                                        int version)
++{
++  return finish_call(fn(app_id, path, device, info, version));
++}
++
++static __declspec(noinline) NgxResult call_snippet_init_core_abi(NgxInitExtCoreFn fn,
++                                                                 unsigned long long app_id,
++                                                                 const wchar_t *path,
++                                                                 ID3D12Device *device,
++                                                                 int version,
++                                                                 const NVSDK_NGX_FeatureCommonInfo *info)
++{
++  return finish_call(fn(app_id, path, device, version, info));
++}
++
++static __declspec(noinline) NgxResult call_create(NgxCreateFn fn,
++                                                  ID3D12GraphicsCommandList *list,
++                                                  int feature,
++                                                  NVSDK_NGX_Parameter *params,
++                                                  NVSDK_NGX_Handle **handle)
++{
++  return finish_call(fn(list, feature, params, handle));
++}
++
++static __declspec(noinline) NgxResult call_eval(NgxEvalFn fn,
++                                                ID3D12GraphicsCommandList *list,
++                                                const NVSDK_NGX_Handle *handle,
++                                                NVSDK_NGX_Parameter *params)
++{
++  return finish_call(fn(list, handle, params, nullptr));
++}
++
++/* The unexported NVSDK_NGX_Parameter instance is an array of setter/getter function pointers.
++ * The helpers below call them directly, so no NVIDIA SDK headers or linking are required. */
++static void SetUll(NVSDK_NGX_Parameter *parameters, const char *name, unsigned long long value)
++{
++  using Fn = void(__cdecl *)(NVSDK_NGX_Parameter *, const char *, unsigned long long);
++  reinterpret_cast<Fn>((*reinterpret_cast<void ***>(parameters))[0])(parameters, name, value);
++}
++
++static void SetResource(NVSDK_NGX_Parameter *parameters, const char *name, ID3D12Resource *value)
++{
++  using Fn = void(__cdecl *)(NVSDK_NGX_Parameter *, const char *, ID3D12Resource *);
++  reinterpret_cast<Fn>((*reinterpret_cast<void ***>(parameters))[1])(parameters, name, value);
++}
++
++static void SetUi(NVSDK_NGX_Parameter *parameters, const char *name, unsigned int value)
++{
++  using Fn = void(__cdecl *)(NVSDK_NGX_Parameter *, const char *, unsigned int);
++  reinterpret_cast<Fn>((*reinterpret_cast<void ***>(parameters))[3])(parameters, name, value);
++}
++
++static void SetI(NVSDK_NGX_Parameter *parameters, const char *name, int value)
++{
++  using Fn = void(__cdecl *)(NVSDK_NGX_Parameter *, const char *, int);
++  reinterpret_cast<Fn>((*reinterpret_cast<void ***>(parameters))[4])(parameters, name, value);
++}
++
++static void SetF(NVSDK_NGX_Parameter *parameters, const char *name, float value)
++{
++  using Fn = void(__cdecl *)(NVSDK_NGX_Parameter *, const char *, float);
++  reinterpret_cast<Fn>((*reinterpret_cast<void ***>(parameters))[6])(parameters, name, value);
++}
++
++static std::wstring find_nr_runtime_dir()
++{
++  const auto has_dll = [](const std::wstring &dir) -> bool {
++    return std::filesystem::is_regular_file(std::filesystem::path(dir) / L"nvngx_dlssnr.dll");
++  };
++
++  const wchar_t *env = _wgetenv(L"DLSS5_RUNTIME_DIR");
++  if (env != nullptr && *env != 0 && has_dll(env)) {
++    return env;
++  }
++
++  wchar_t module_path[MAX_PATH] = {};
++  const DWORD length = GetModuleFileNameW(nullptr, module_path, ARRAYSIZE(module_path));
++  if (length == 0 || length >= ARRAYSIZE(module_path)) {
++    return {};
++  }
++  const std::wstring executable = std::filesystem::path(module_path).parent_path().wstring();
++  const std::vector<std::wstring> candidates = {
++      (std::filesystem::path(executable) / L"dlss5").wstring(),
++      executable,
++  };
++  for (const std::wstring &candidate : candidates) {
++    if (has_dll(candidate)) {
++      return candidate;
++    }
++  }
++  return {};
++}
++
++static std::wstring find_driver_store_core()
++{
++  wchar_t system32[MAX_PATH] = {};
++  if (GetSystemDirectoryW(system32, ARRAYSIZE(system32)) == 0) {
++    return {};
++  }
++  const std::wstring root = (std::filesystem::path(system32) / L"DriverStore" / L"FileRepository").wstring();
++  std::error_code error;
++  if (!std::filesystem::is_directory(root, error)) {
++    return {};
++  }
++  std::wstring newest_name;
++  std::wstring newest_path;
++  std::filesystem::file_time_type newest_time = std::filesystem::file_time_type::min();
++  for (const auto &entry :
++       std::filesystem::directory_iterator(root,
++                                           std::filesystem::directory_options::skip_permission_denied,
++                                           error))
++  {
++    if (!entry.is_directory()) {
++      continue;
++    }
++    const std::wstring name = entry.path().filename().wstring();
++    if (name.size() < 4 || name.compare(0, 2, L"nv") != 0 ||
++        name.find(L".inf_") == std::wstring::npos)
++    {
++      continue;
++    }
++    const std::wstring candidate = (entry.path() / L"_nvngx.dll").wstring();
++    std::error_code file_error;
++    if (!std::filesystem::is_regular_file(candidate, file_error)) {
++      continue;
++    }
++    const bool is_dispi = name.find(L"nv_dispi") != std::wstring::npos;
++    const bool current_dispi = newest_name.find(L"nv_dispi") != std::wstring::npos;
++    const auto time = std::filesystem::last_write_time(candidate, file_error);
++    bool better = false;
++    if (newest_path.empty()) {
++      better = true;
++    }
++    else if (is_dispi != current_dispi) {
++      better = is_dispi;
++    }
++    else if (!file_error) {
++      better = time > newest_time;
++    }
++    if (better) {
++      newest_name = name;
++      newest_path = candidate;
++      if (!file_error) {
++        newest_time = time;
++      }
++    }
++  }
++  return newest_path;
++}
++
++static std::wstring ngx_data_directory()
++{
++  const wchar_t *env = _wgetenv(L"DLSS5_CACHE_DIR");
++  if (env != nullptr && *env != 0) {
++    std::wstring dir = env;
++    std::error_code error;
++    if (std::filesystem::is_directory(dir, error) ||
++        std::filesystem::create_directories(dir, error))
++    {
++      return dir;
++    }
++  }
++  char cache[512] = {};
++  BKE_appdir_folder_caches(cache, sizeof(cache));
++  if (cache[0] == 0) {
++    return {};
++  }
++  const std::wstring dir = (std::filesystem::path(utf8_to_wstring(cache)) / L"dlss5").wstring();
++  std::error_code error;
++  std::filesystem::create_directories(dir, error);
++  return dir;
++}
++
++class Dx12NR {
++ public:
++  ~Dx12NR();
++  bool apply(const Result &color,
++             const Result *depth,
++             const Result *motion,
++             const Result *mask,
++             const DLSSNRParams &params,
++             Result &output);
++
++ private:
++  bool ensure_adapter();
++  bool ensure_device();
++  void execute_and_wait();
++  bool load_modules();
++  bool alloc_params();
++  bool init_ngx_session();
++  bool ensure_feature(int width, int height, bool have_depth, bool have_motion, const DLSSNRParams &params);
++  void set_params(int width, int height, bool have_depth, bool have_motion, const DLSSNRParams &params, bool do_reset);
++  void stage_inputs(const Result &color,
++                    const Result *depth,
++                    const Result *motion,
++                    int width,
++                    int height,
++                    bool clamp_input);
++  void copy_texture_from_upload();
++  void copy_texture_to_readback();
++  void download_color(Result &output, const Result &color, const Result *mask, int width, int height, bool clamp_input);
++
++  ComPtr<IDXGIAdapter1> adapter_;
++  ComPtr<ID3D12Device> device_;
++  ComPtr<ID3D12CommandQueue> queue_;
++  ComPtr<ID3D12CommandAllocator> allocator_;
++  ComPtr<ID3D12GraphicsCommandList> cmdlist_;
++  ComPtr<ID3D12Fence> fence_;
++  HANDLE event_ = nullptr;
++  UINT64 fence_value_ = 0;
++
++  HMODULE core_ = nullptr;
++  HMODULE snippet_ = nullptr;
++  std::wstring runtime_dir_;
++  std::wstring cache_dir_;
++  NVSDK_NGX_Parameter *params_ = nullptr;
++  NVSDK_NGX_Handle *handle_ = nullptr;
++  const wchar_t *feature_paths_[1] = {nullptr};
++  void **iat_slot_ = nullptr;
++  bool ngx_ready_ = false;
++
++  NgxInitProjectFn core_init_project_id_ = nullptr;
++  NgxInitProjectFn core_init_project_ = nullptr;
++  NgxInitExtCoreFn core_init_ext_ = nullptr;
++  NgxShutdownFn core_shutdown1_ = nullptr;
++  NgxAllocFn core_alloc_params_ = nullptr;
++  NgxDestroyPFn core_destroy_params_ = nullptr;
++  NgxInitExtSnippetFn snippet_init_ext_ = nullptr;
++  NgxInitExtCoreFn snippet_init_ext_core_abi_ = nullptr;
++  NgxCreateFn snippet_create_ = nullptr;
++  NgxEvalFn snippet_eval_ = nullptr;
++  NgxReleaseFn snippet_release_ = nullptr;
++
++  ComPtr<ID3D12Resource> tex_color_;
++  ComPtr<ID3D12Resource> tex_output_;
++  ComPtr<ID3D12Resource> tex_depth_;
++  ComPtr<ID3D12Resource> tex_motion_;
++  ComPtr<ID3D12Resource> upload_;
++  ComPtr<ID3D12Resource> readback_;
++  D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp_color_ = {};
++  D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp_depth_ = {};
++  D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp_motion_ = {};
++  D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp_output_ = {};
++  UINT64 color_bytes_ = 0;
++  UINT64 depth_bytes_ = 0;
++  UINT64 motion_bytes_ = 0;
++  UINT64 output_bytes_ = 0;
++  int last_width_ = 0;
++  int last_height_ = 0;
++  int last_style_ = -1;
++  bool last_have_depth_ = false;
++  bool last_have_motion_ = false;
++  uint64_t last_view_key_ = 0;
++  bool has_history_ = false;
++};bool Dx12NR::ensure_adapter()
++{
++  if (adapter_ != nullptr) {
++    return true;
++  }
++  ComPtr<IDXGIFactory1> factory;
++  if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
++    set_nr_error("CreateDXGIFactory1 failed.");
++    return false;
++  }
++  for (unsigned int index = 0;; ++index) {
++    ComPtr<IDXGIAdapter1> candidate;
++    if (factory->EnumAdapters1(index, &candidate) == DXGI_ERROR_NOT_FOUND) {
++      break;
++    }
++    DXGI_ADAPTER_DESC1 desc = {};
++    if (SUCCEEDED(candidate->GetDesc1(&desc)) && (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0 &&
++        desc.VendorId == 0x10DE)
++    {
++      adapter_ = candidate;
++      return true;
++    }
++  }
++  set_nr_error("No NVIDIA D3D12 adapter found. DLSSNR runs on NVIDIA GPUs only.");
++  return false;
++}
++
++bool Dx12NR::ensure_device()
++{
++  if (device_ != nullptr) {
++    return true;
++  }
++  if (!ensure_adapter()) {
++    return false;
++  }
++  if (FAILED(D3D12CreateDevice(adapter_.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device_)))) {
++    set_nr_error("D3D12CreateDevice failed.");
++    return false;
++  }
++  D3D12_COMMAND_QUEUE_DESC queue_desc = {};
++  queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
++  if (FAILED(device_->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue_)))) {
++    set_nr_error("CreateCommandQueue failed.");
++    return false;
++  }
++  if (FAILED(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator_)))) {
++    set_nr_error("CreateCommandAllocator failed.");
++    return false;
++  }
++  if (FAILED(device_->CreateCommandList(0,
++                                        D3D12_COMMAND_LIST_TYPE_DIRECT,
++                                        allocator_.Get(),
++                                        nullptr,
++                                        IID_PPV_ARGS(&cmdlist_))))
++  {
++    set_nr_error("CreateCommandList failed.");
++    return false;
++  }
++  if (FAILED(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)))) {
++    set_nr_error("CreateFence failed.");
++    return false;
++  }
++  event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++  if (event_ == nullptr) {
++    set_nr_error("CreateEventW failed.");
++    return false;
++  }
++  return true;
++}
++
++void Dx12NR::execute_and_wait()
++{
++  if (cmdlist_ == nullptr || queue_ == nullptr || fence_ == nullptr || event_ == nullptr) {
++    return;
++  }
++  if (FAILED(cmdlist_->Close())) {
++    return;
++  }
++  ID3D12CommandList *lists[] = {cmdlist_.Get()};
++  queue_->ExecuteCommandLists(1, lists);
++  ++fence_value_;
++  queue_->Signal(fence_, fence_value_);
++  if (fence_->GetCompletedValue() < fence_value_) {
++    fence_->SetEventOnCompletion(fence_value_, event_);
++    WaitForSingleObject(event_, 30000);
++  }
++  allocator_->Reset();
++  cmdlist_->Reset(allocator_.Get(), nullptr);
++}
++
++Dx12NR::~Dx12NR()
++{
++  if (handle_ != nullptr && snippet_release_ != nullptr) {
++    snippet_release_(handle_);
++  }
++  handle_ = nullptr;
++  if (params_ != nullptr && core_destroy_params_ != nullptr) {
++    core_destroy_params_(params_);
++  }
++  params_ = nullptr;
++  if (core_ != nullptr && core_shutdown1_ != nullptr && device_ != nullptr) {
++    core_shutdown1_(device_.Get());
++  }
++  if (iat_slot_ != nullptr && g_original_get_module != nullptr) {
++    write_iat(iat_slot_, reinterpret_cast<void *>(g_original_get_module));
++  }
++  iat_slot_ = nullptr;
++  g_hooked_snippet = nullptr;
++  g_hooked_core = nullptr;
++  if (core_ != nullptr) {
++    FreeLibrary(core_);
++  }
++  if (snippet_ != nullptr) {
++    FreeLibrary(snippet_);
++  }
++  core_ = nullptr;
++  snippet_ = nullptr;
++  if (event_ != nullptr) {
++    CloseHandle(event_);
++    event_ = nullptr;
++  }
++}
++
++bool Dx12NR::load_modules()
++{
++  runtime_dir_ = find_nr_runtime_dir();
++  cache_dir_ = ngx_data_directory();
++  if (runtime_dir_.empty()) {
++    set_nr_error("nvngx_dlssnr.dll not found. Place your DLSS5 (dlss5) folder next to Blender, or set DLSS5_RUNTIME_DIR.");
++    return false;
++  }
++  if (cache_dir_.empty()) {
++    set_nr_error("DLSS5 cache directory could not be created. Set DLSS5_CACHE_DIR.");
++    return false;
++  }
++
++  std::vector<std::wstring> core_candidates;
++  const std::wstring driver_store = find_driver_store_core();
++  if (!driver_store.empty()) {
++    core_candidates.push_back(driver_store);
++  }
++  const std::wstring runtime_core[] = {
++      (std::filesystem::path(runtime_dir_) / L"_nvngx.dll").wstring(),
++      (std::filesystem::path(runtime_dir_) / L"nvngx.dll").wstring(),
++  };
++  for (const std::wstring &path : runtime_core) {
++    core_candidates.push_back(path);
++  }
++  core_candidates.push_back((std::filesystem::path(L"C:\\Windows\\System32") / L"_nvngx.dll").wstring());
++
++  std::error_code error;
++  for (const std::wstring &path : core_candidates) {
++    if (!std::filesystem::is_regular_file(path, error)) {
++      continue;
++    }
++    HMODULE module = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
++    if (module != nullptr) {
++      core_ = module;
++      break;
++    }
++  }
++  if (core_ == nullptr) {
++    set_nr_error("_nvngx.dll (NVNGX core) not found. Install the NVIDIA app or DLSS, or copy _nvngx.dll/nvngx.dll into the dlss5 directory.");
++    return false;
++  }
++
++  const std::wstring snippet_path = (std::filesystem::path(runtime_dir_) / L"nvngx_dlssnr.dll").wstring();
++  snippet_ = LoadLibraryExW(snippet_path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
++  if (snippet_ == nullptr) {
++    set_nr_error("nvngx_dlssnr.dll could not be loaded from the dlss5 directory.");
++    return false;
++  }
++
++  core_init_project_id_ = reinterpret_cast<NgxInitProjectFn>(
++      GetProcAddress(core_, "NVSDK_NGX_D3D12_Init_with_ProjectID"));
++  core_init_project_ = reinterpret_cast<NgxInitProjectFn>(
++      GetProcAddress(core_, "NVSDK_NGX_D3D12_Init_ProjectID"));
++  core_init_ext_ = reinterpret_cast<NgxInitExtCoreFn>(
++      GetProcAddress(core_, "NVSDK_NGX_D3D12_Init_Ext"));
++  core_shutdown1_ = reinterpret_cast<NgxShutdownFn>(
++      GetProcAddress(core_, "NVSDK_NGX_D3D12_Shutdown1"));
++  core_alloc_params_ = reinterpret_cast<NgxAllocFn>(
++      GetProcAddress(core_, "NVSDK_NGX_D3D12_AllocateParameters"));
++  core_destroy_params_ = reinterpret_cast<NgxDestroyPFn>(
++      GetProcAddress(core_, "NVSDK_NGX_D3D12_DestroyParameters"));
++
++  snippet_init_ext_ = reinterpret_cast<NgxInitExtSnippetFn>(
++      GetProcAddress(snippet_, "NVSDK_NGX_D3D12_Init_Ext"));
++  snippet_init_ext_core_abi_ = reinterpret_cast<NgxInitExtCoreFn>(
++      GetProcAddress(snippet_, "NVSDK_NGX_D3D12_Init_Ext"));
++  snippet_create_ = reinterpret_cast<NgxCreateFn>(
++      GetProcAddress(snippet_, "NVSDK_NGX_D3D12_CreateFeature"));
++  snippet_eval_ = reinterpret_cast<NgxEvalFn>(
++      GetProcAddress(snippet_, "NVSDK_NGX_D3D12_EvaluateFeature"));
++  snippet_release_ = reinterpret_cast<NgxReleaseFn>(
++      GetProcAddress(snippet_, "NVSDK_NGX_D3D12_ReleaseFeature"));
++
++  if (core_init_ext_ == nullptr || core_alloc_params_ == nullptr ||
++      core_destroy_params_ == nullptr || snippet_init_ext_ == nullptr ||
++      snippet_create_ == nullptr || snippet_eval_ == nullptr)
++  {
++    set_nr_error("nvngx_dlssnr.dll exports are missing. Unsigned or wrong-version binaries?");
++    return false;
++  }
++
++  if (!hook_snippet_get_module_file_name(snippet_, core_, &iat_slot_)) {
++    set_nr_error("Could not patch the nvngx_dlssnr.dll import table (GetModuleFileNameW).");
++    return false;
++  }
++  feature_paths_[0] = runtime_dir_.c_str();
++  return true;
++}
++
++bool Dx12NR::alloc_params()
++{
++  if (core_alloc_params_(&params_) != kNgxSuccess) {
++    set_nr_error("NVSDK_NGX_D3D12_AllocateParameters failed.");
++    return false;
++  }
++  return true;
++}
++
++static NgxResult call_core_init_project(NgxInitProjectFn fn,
++                                        const char *project_id,
++                                        int engine,
++                                        const char *version,
++                                        const wchar_t *path,
++                                        ID3D12Device *device,
++                                        const NVSDK_NGX_FeatureCommonInfo *info,
++                                        int sdk_version);
++static NgxResult call_core_init_ext(NgxInitExtCoreFn fn,
++                                    unsigned long long app_id,
++                                    const wchar_t *path,
++                                    ID3D12Device *device,
++                                    int version,
++                                    const NVSDK_NGX_FeatureCommonInfo *info);
++
++bool Dx12NR::init_ngx_session()
++{
++  feature_paths_[0] = runtime_dir_.c_str();
++  NVSDK_NGX_FeatureCommonInfo common;
++  common.PathListInfo = {feature_paths_, 1};
++  common.internal_data = nullptr;
++  common.LoggingInfo = {nullptr, 1, false};
++
++  const std::string data_dir = std::filesystem::path(cache_dir_).u8string();
++  const char *project_id = "e40890d0-da76-467b-8130-12f3ada8d7c8";
++  const char *custom_project_id = "53f803cc-a12f-4d69-90d5-19b7599cad19";
++  NgxResult result = NgxResult(0);
++
++  if (core_init_project_id_ != nullptr) {
++    result = call_core_init_project(core_init_project_id_,
++                                    project_id,
++                                    kEngineTypeUnity,
++                                    "6000.3",
++                                    runtime_dir_.c_str(),
++                                    device_.Get(),
++                                    &common,
++                                    kSdkSnippet);
++  }
++  if (result != kNgxSuccess && core_init_project_ != nullptr) {
++    result = call_core_init_project(core_init_project_,
++                                    project_id,
++                                    kEngineTypeUnity,
++                                    "6000.3",
++                                    runtime_dir_.c_str(),
++                                    device_.Get(),
++                                    &common,
++                                    kSdkSnippet);
++  }
++  if (result != kNgxSuccess && core_init_project_id_ != nullptr) {
++    result = call_core_init_project(core_init_project_id_,
++                                    custom_project_id,
++                                    6,
++                                    "0.3.0",
++                                    runtime_dir_.c_str(),
++                                    device_.Get(),
++                                    &common,
++                                    kSdkSnippet);
++  }
++  for (int version = 0x13; result != kNgxSuccess && version <= 0x20; ++version) {
++    result = call_core_init_ext(core_init_ext_,
++                                kAppIdUnity,
++                                runtime_dir_.c_str(),
++                                device_.Get(),
++                                version,
++                                &common);
++  }
++  if (result != kNgxSuccess) {
++    set_nr_error("NVNGX core (_nvngx.dll) init failed.");
++    return false;
++  }
++
++  result = NgxResult(0);
++  if (snippet_init_ext_ != nullptr) {
++    result = call_snippet_init(snippet_init_ext_,
++                               kAppIdUnity,
++                               runtime_dir_.c_str(),
++                               device_.Get(),
++                               &common,
++                               kSdkSnippet);
++    if (result != kNgxSuccess) {
++      result = call_snippet_init(snippet_init_ext_,
++                                 kAppIdPhoenix,
++                                 runtime_dir_.c_str(),
++                                 device_.Get(),
++                                 &common,
++                                 kSdkSnippet);
++    }
++  }
++  if (result != kNgxSuccess && snippet_init_ext_core_abi_ != nullptr) {
++    result = call_snippet_init_core_abi(snippet_init_ext_core_abi_,
++                                        kAppIdUnity,
++                                        runtime_dir_.c_str(),
++                                        device_.Get(),
++                                        kSdkSnippet,
++                                        &common);
++    if (result != kNgxSuccess) {
++      result = call_snippet_init_core_abi(snippet_init_ext_core_abi_,
++                                          kAppIdPhoenix,
++                                          runtime_dir_.c_str(),
++                                          device_.Get(),
++                                          kSdkSnippet,
++                                          &common);
++    }
++  }
++  if (result != kNgxSuccess) {
++    set_nr_error("nvngx_dlssnr.dll init failed. A signed nvngx_dlssnr.dll is required.");
++    return false;
++  }
++  ngx_ready_ = true;
++  return true;
++}
++
++static __declspec(noinline) NgxResult call_core_init_project(NgxInitProjectFn fn,
++                                                             const char *project_id,
++                                                             int engine,
++                                                             const char *version,
++                                                             const wchar_t *path,
++                                                             ID3D12Device *device,
++                                                             const NVSDK_NGX_FeatureCommonInfo *info,
++                                                             int sdk_version)
++{
++  return finish_call(fn(project_id, engine, version, path, device, info, sdk_version));
++}
++
++static __declspec(noinline) NgxResult call_core_init_ext(NgxInitExtCoreFn fn,
++                                                         unsigned long long app_id,
++                                                         const wchar_t *path,
++                                                         ID3D12Device *device,
++                                                         int version,
++                                                         const NVSDK_NGX_FeatureCommonInfo *info)
++{
++  return finish_call(fn(app_id, path, device, version, info));
++}
++
++bool Dx12NR::ensure_feature(int width,
++                            int height,
++                            bool have_depth,
++                            bool have_motion,
++                            const DLSSNRParams &params)
++{
++  const int style = std::clamp(int(params.style), 0, 2);
++  if (handle_ != nullptr && width == last_width_ && height == last_height_ &&
++      style == last_style_ && have_depth == last_have_depth_ &&
++      have_motion == last_have_motion_)
++  {
++    return true;
++  }
++  if (handle_ != nullptr && snippet_release_ != nullptr) {
++    snippet_release_(handle_);
++  }
++  handle_ = nullptr;
++
++  last_width_ = width;
++  last_height_ = height;
++  last_style_ = style;
++  last_have_depth_ = have_depth;
++  last_have_motion_ = have_motion;
++  has_history_ = false;
++
++  D3D12_RESOURCE_DESC base_desc = {};
++  base_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++  base_desc.Width = width;
++  base_desc.Height = height;
++  base_desc.DepthOrArraySize = 1;
++  base_desc.MipLevels = 1;
++  base_desc.SampleDesc.Count = 1;
++
++  D3D12_HEAP_PROPERTIES default_heap = {};
++  default_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
++
++  D3D12_RESOURCE_DESC color_desc = base_desc;
++  color_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
++  color_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
++  if (FAILED(device_->CreateCommittedResource(&default_heap,
++                                              D3D12_HEAP_FLAG_NONE,
++                                              &color_desc,
++                                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++                                              nullptr,
++                                              IID_PPV_ARGS(&tex_color_))))
++  {
++    set_nr_error("CreateCommittedResource (color) failed.");
++    return false;
++  }
++  if (FAILED(device_->CreateCommittedResource(&default_heap,
++                                              D3D12_HEAP_FLAG_NONE,
++                                              &color_desc,
++                                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++                                              nullptr,
++                                              IID_PPV_ARGS(&tex_output_))))
++  {
++    set_nr_error("CreateCommittedResource (output) failed.");
++    return false;
++  }
++
++  tex_depth_.Reset();
++  tex_motion_.Reset();
++  D3D12_RESOURCE_DESC guide_desc = base_desc;
++  guide_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
++  if (have_depth) {
++    guide_desc.Format = DXGI_FORMAT_R32_FLOAT;
++    if (FAILED(device_->CreateCommittedResource(&default_heap,
++                                                D3D12_HEAP_FLAG_NONE,
++                                                &guide_desc,
++                                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++                                                nullptr,
++                                                IID_PPV_ARGS(&tex_depth_))))
++    {
++      set_nr_error("CreateCommittedResource (depth) failed.");
++      return false;
++    }
++  }
++  if (have_motion) {
++    guide_desc.Format = DXGI_FORMAT_R16G16_FLOAT;
++    if (FAILED(device_->CreateCommittedResource(&default_heap,
++                                                D3D12_HEAP_FLAG_NONE,
++                                                &guide_desc,
++                                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++                                                nullptr,
++                                                IID_PPV_ARGS(&tex_motion_))))
++    {
++      set_nr_error("CreateCommittedResource (motion) failed.");
++      return false;
++    }
++  }
++
++  UINT64 upload_bytes = 0;
++  auto reserve_upload = [this, &upload_bytes](const D3D12_RESOURCE_DESC &texture_desc,
++                                              D3D12_PLACED_SUBRESOURCE_FOOTPRINT &footprint,
++                                              UINT64 &bytes) {
++    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout = {};
++    device_->GetCopyableFootprints(&texture_desc, 0, 1, 0, &layout, nullptr, nullptr, nullptr);
++    layout.Footprint.RowPitch = (layout.Footprint.RowPitch + 511) & ~511ull;
++    const UINT64 needed = size_t(layout.Footprint.Height) * layout.Footprint.RowPitch;
++    upload_bytes = (upload_bytes + 511) & ~511ull;
++    layout.Offset = upload_bytes;
++    upload_bytes += needed;
++    footprint = layout;
++    bytes = needed;
++    return needed;
++  };
++
++  color_bytes_ = 0;
++  depth_bytes_ = 0;
++  motion_bytes_ = 0;
++  reserve_upload(color_desc, fp_color_, color_bytes_);
++  if (have_depth) {
++    guide_desc.Format = DXGI_FORMAT_R32_FLOAT;
++    reserve_upload(guide_desc, fp_depth_, depth_bytes_);
++  }
++  if (have_motion) {
++    guide_desc.Format = DXGI_FORMAT_R16G16_FLOAT;
++    reserve_upload(guide_desc, fp_motion_, motion_bytes_);
++  }
++  upload_bytes = (upload_bytes + 511) & ~511ull;
++
++  upload_.Reset();
++  if (upload_bytes > 0) {
++    D3D12_RESOURCE_DESC buffer_desc = {};
++    buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++    buffer_desc.Width = upload_bytes;
++    buffer_desc.Height = 1;
++    buffer_desc.DepthOrArraySize = 1;
++    buffer_desc.MipLevels = 1;
++    buffer_desc.SampleDesc.Count = 1;
++    buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++    D3D12_HEAP_PROPERTIES upload_heap = {};
++    upload_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
++    if (FAILED(device_->CreateCommittedResource(&upload_heap,
++                                                D3D12_HEAP_FLAG_NONE,
++                                                &buffer_desc,
++                                                D3D12_RESOURCE_STATE_GENERIC_READ,
++                                                nullptr,
++                                                IID_PPV_ARGS(&upload_))))
++    {
++      set_nr_error("CreateCommittedResource (upload) failed.");
++      return false;
++    }
++  }
++
++  D3D12_PLACED_SUBRESOURCE_FOOTPRINT output_layout = {};
++  device_->GetCopyableFootprints(&color_desc, 0, 1, 0, &output_layout, nullptr, nullptr, nullptr);
++  output_layout.Footprint.RowPitch = (output_layout.Footprint.RowPitch + 511) & ~511ull;
++  output_bytes_ = size_t(output_layout.Footprint.Height) * output_layout.Footprint.RowPitch;
++  fp_output_ = output_layout;
++  readback_.Reset();
++  D3D12_RESOURCE_DESC readback_desc = {};
++  readback_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++  readback_desc.Width = output_bytes_;
++  readback_desc.Height = 1;
++  readback_desc.DepthOrArraySize = 1;
++  readback_desc.MipLevels = 1;
++  readback_desc.SampleDesc.Count = 1;
++  readback_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++  D3D12_HEAP_PROPERTIES readback_heap = {};
++  readback_heap.Type = D3D12_HEAP_TYPE_READBACK;
++  if (FAILED(device_->CreateCommittedResource(&readback_heap,
++                                              D3D12_HEAP_FLAG_NONE,
++                                              &readback_desc,
++                                              D3D12_RESOURCE_STATE_COPY_DEST,
++                                              nullptr,
++                                              IID_PPV_ARGS(&readback_))))
++  {
++    set_nr_error("CreateCommittedResource (readback) failed.");
++    return false;
++  }
++
++  set_params(width, height, have_depth, have_motion, params, true);
++  const NgxResult result = call_create(snippet_create_, cmdlist_.Get(), kFeatureId, params_, &handle_);
++  if (result != kNgxSuccess) {
++    char buffer[128];
++    SNPRINTF(buffer,
++             "CreateFeature(18) failed (0x%08x). Need signed nvngx_dlssnr.dll and RTX 50.",
++             unsigned(result));
++    set_nr_error(buffer);
++    handle_ = nullptr;
++    return false;
++  }
++  execute_and_wait();
++  return true;
++}
++
++void Dx12NR::set_params(int width,
++                        int height,
++                        bool have_depth,
++                        bool have_motion,
++                        const DLSSNRParams &params,
++                        bool do_reset)
++{
++  SetResource(params_, "DLSSNR.Color", tex_color_.Get());
++  SetResource(params_, "DLSSNR.Output", tex_output_.Get());
++  SetResource(params_, "DLSSNR.Backbuffer", do_reset ? tex_color_.Get() : tex_output_.Get());
++  SetResource(params_, "DLSSNR.Depth", have_depth ? tex_depth_.Get() : nullptr);
++  SetResource(params_, "DLSSNR.MVec", have_motion ? tex_motion_.Get() : nullptr);
++  SetI(params_, "Width", width);
++  SetI(params_, "Height", height);
++  SetI(params_, "OutWidth", width);
++  SetI(params_, "OutHeight", height);
++  SetUi(params_, "DLSSNR.Width", unsigned(width));
++  SetUi(params_, "DLSSNR.Height", unsigned(height));
++  SetUi(params_, "DLSSNR.Enabled", 1u);
++  SetUi(params_, "DLSSNR.Reset", do_reset ? 1u : 0u);
++  SetUi(params_, "Reset", do_reset ? 1u : 0u);
++  SetF(params_, "DLSSNR.JitterOffsetX", 0.0f);
++  SetF(params_, "DLSSNR.JitterOffsetY", 0.0f);
++  SetUi(params_, "DLSSNR.DepthInverted", 1u);
++  SetF(params_, "DLSSNR.ScalingRatio", 1.0f);
++  SetI(params_, "DLSSNR.ColorSubrectWidth", width);
++  SetI(params_, "DLSSNR.ColorSubrectHeight", height);
++  SetI(params_, "DLSSNR.ColorSubrectX", 0);
++  SetI(params_, "DLSSNR.ColorSubrectY", 0);
++  SetI(params_, "DLSSNR.OutputSubrectWidth", width);
++  SetI(params_, "DLSSNR.OutputSubrectHeight", height);
++  SetI(params_, "DLSSNR.OutputSubrectX", 0);
++  SetI(params_, "DLSSNR.OutputSubrectY", 0);
++  if (have_depth) {
++    SetI(params_, "DLSSNR.DepthSubrectWidth", width);
++    SetI(params_, "DLSSNR.DepthSubrectHeight", height);
++    SetI(params_, "DLSSNR.DepthSubrectX", 0);
++    SetI(params_, "DLSSNR.DepthSubrectY", 0);
++  }
++  if (have_motion) {
++    SetI(params_, "DLSSNR.MVecSubrectWidth", width);
++    SetI(params_, "DLSSNR.MVecSubrectHeight", height);
++    SetI(params_, "DLSSNR.MVecSubrectX", 0);
++    SetI(params_, "DLSSNR.MVecSubrectY", 0);
++  }
++  SetF(params_, "DLSSNR.MVecScaleX", 1.0f);
++  SetF(params_, "DLSSNR.MVecScaleY", 1.0f);
++  SetF(params_, "DLSSNR.Intensity", std::clamp(params.intensity, 0.0f, 2.0f));
++  SetF(params_, "DLSSNR.LocalToneStructureStrength", std::clamp(params.structure, 0.0f, 2.0f));
++  SetF(params_, "DLSSNR.LocalToneStrength", std::clamp(params.tone, 0.0f, 2.0f));
++  SetF(params_, "DLSSNR.SkinStructureStrength", std::clamp(params.skin, 0.0f, 2.0f));
++  SetI(params_, "DLSSNR.Style", std::clamp(int(params.style), 0, 2));
++  SetUi(params_, "DLSSNR.UseAutoMask", params.auto_mask ? 1u : 0u);
++  SetUi(params_, "DLSSNR.UICorrection", params.ui_correction ? 1u : 0u);
++  SetUi(params_, "CreationNodeMask", 1u);
++  SetUi(params_, "VisibilityNodeMask", 1u);
++}
++
++void Dx12NR::stage_inputs(const Result &color,
++                          const Result *depth,
++                          const Result *motion,
++                          int width,
++                          int height,
++                          bool clamp_input)
++{
++  if (upload_ == nullptr) {
++    return;
++  }
++  D3D12_RANGE range = {0, color_bytes_ + depth_bytes_ + motion_bytes_};
++  void *data = nullptr;
++  upload_->Map(0, &range, &data);
++  if (data == nullptr) {
++    return;
++  }
++  BYTE *base = static_cast<BYTE *>(data);
++
++  for (int dst_y = 0; dst_y < height; ++dst_y) {
++    const int src_y = height - 1 - dst_y;
++    for (int x = 0; x < width; ++x) {
++      const Color c = color.load_pixel<Color>(int2(x, src_y));
++      uint16_t *texel = reinterpret_cast<uint16_t *>(base + fp_color_.Offset +
++                                                     size_t(fp_color_.Footprint.RowPitch) * dst_y +
++                                                     size_t(x) * 8);
++      texel[0] = float_to_half(clamp_input ? std::clamp(c.r, 0.0f, 1.0f) : c.r);
++      texel[1] = float_to_half(clamp_input ? std::clamp(c.g, 0.0f, 1.0f) : c.g);
++      texel[2] = float_to_half(clamp_input ? std::clamp(c.b, 0.0f, 1.0f) : c.b);
++      texel[3] = float_to_half(c.a);
++    }
++    if (depth != nullptr) {
++      for (int x = 0; x < width; ++x) {
++        const float *dst_texel = reinterpret_cast<float *>(base + fp_depth_.Offset +
++                                                           size_t(fp_depth_.Footprint.RowPitch) * dst_y +
++                                                           size_t(x) * 4);
++        *const_cast<float *>(dst_texel) = depth->load_pixel<float>(int2(x, src_y));
++      }
++    }
++    if (motion != nullptr) {
++      for (int x = 0; x < width; ++x) {
++        const float2 mv = motion->load_pixel<float2>(int2(x, src_y));
++        uint16_t *texel = reinterpret_cast<uint16_t *>(base + fp_motion_.Offset +
++                                                       size_t(fp_motion_.Footprint.RowPitch) * dst_y +
++                                                       size_t(x) * 4);
++        texel[0] = float_to_half(mv.x);
++        texel[1] = float_to_half(-mv.y);
++      }
++    }
++  }
++  upload_->Unmap(0, nullptr);
++}
++
++void Dx12NR::copy_texture_from_upload()
++{
++  if (upload_ == nullptr) {
++    return;
++  }
++  auto transition = [this](ID3D12Resource *texture,
++                           D3D12_RESOURCE_STATES before,
++                           D3D12_RESOURCE_STATES after) {
++    D3D12_RESOURCE_BARRIER barrier = {};
++    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    barrier.Transition.pResource = texture;
++    barrier.Transition.Subresource = 0;
++    barrier.Transition.StateBefore = before;
++    barrier.Transition.StateAfter = after;
++    cmdlist_->ResourceBarrier(1, &barrier);
++  };
++
++  D3D12_BOX box = {};
++  box.right = last_width_;
++  box.bottom = last_height_;
++  box.back = 1;
++
++  D3D12_TEXTURE_COPY_LOCATION dst = {};
++  dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++  dst.SubresourceIndex = 0;
++  D3D12_TEXTURE_COPY_LOCATION src = {};
++  src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++  src.pResource = upload_.Get();
++
++  transition(tex_color_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
++  dst.pResource = tex_color_.Get();
++  src.PlacedFootprint = fp_color_;
++  cmdlist_->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
++  transition(tex_color_.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++
++  if (tex_depth_ != nullptr && depth_bytes_ > 0) {
++    transition(tex_depth_.Get(),
++               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++               D3D12_RESOURCE_STATE_COPY_DEST);
++    dst.pResource = tex_depth_.Get();
++    src.PlacedFootprint = fp_depth_;
++    cmdlist_->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
++    transition(tex_depth_.Get(),
++               D3D12_RESOURCE_STATE_COPY_DEST,
++               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++  }
++  if (tex_motion_ != nullptr && motion_bytes_ > 0) {
++    transition(tex_motion_.Get(),
++               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++               D3D12_RESOURCE_STATE_COPY_DEST);
++    dst.pResource = tex_motion_.Get();
++    src.PlacedFootprint = fp_motion_;
++    cmdlist_->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
++    transition(tex_motion_.Get(),
++               D3D12_RESOURCE_STATE_COPY_DEST,
++               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++  }
++}
++
++void Dx12NR::copy_texture_to_readback()
++{
++  if (readback_ == nullptr || tex_output_ == nullptr) {
++    return;
++  }
++  D3D12_RESOURCE_BARRIER barrier = {};
++  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++  barrier.Transition.pResource = tex_output_.Get();
++  barrier.Transition.Subresource = 0;
++  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
++  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
++  cmdlist_->ResourceBarrier(1, &barrier);
++
++  D3D12_TEXTURE_COPY_LOCATION dst = {};
++  dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++  dst.pResource = readback_.Get();
++  dst.PlacedFootprint = fp_output_;
++  D3D12_TEXTURE_COPY_LOCATION src = {};
++  src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++  src.pResource = tex_output_.Get();
++  src.SubresourceIndex = 0;
++  cmdlist_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
++
++  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
++  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
++  cmdlist_->ResourceBarrier(1, &barrier);
++}
++
++void Dx12NR::download_color(Result &output,
++                            const Result &color,
++                            const Result *mask,
++                            int width,
++                            int height,
++                            bool clamp_input)
++{
++  if (readback_ == nullptr) {
++    return;
++  }
++  D3D12_RANGE range = {0, output_bytes_};
++  void *mapped = nullptr;
++  if (FAILED(readback_->Map(0, &range, &mapped))) {
++    return;
++  }
++  const BYTE *bytes = static_cast<const BYTE *>(mapped);
++
++  /* Some DLSSNR versions output BGR instead of RGB. Detect against the original input color. */
++  float diff_rgb = 0.0f;
++  float diff_bgr = 0.0f;
++  for (int64_t i = 0; i < int64_t(width) * height; i += 17) {
++    const int x = int(i % width);
++    const int y = int(i / width);
++    const uint16_t *h = reinterpret_cast<const uint16_t *>(bytes + fp_output_.Offset +
++                                                           size_t(fp_output_.Footprint.RowPitch) * y +
++                                                           size_t(x) * 8);
++    const float r = half_to_float(h[0]);
++    const float g = half_to_float(h[1]);
++    const float b = half_to_float(h[2]);
++    const Color src = color.load_pixel<Color>(int2(x, y));
++    diff_rgb += std::fabs(r - src.r) + std::fabs(g - src.g) + std::fabs(b - src.b);
++    diff_bgr += std::fabs(b - src.r) + std::fabs(g - src.g) + std::fabs(r - src.b);
++  }
++  const bool swap_rgb = diff_bgr < diff_rgb;
++
++  for (int dst_y = 0; dst_y < height; ++dst_y) {
++    /* The compositor result is stored bottom-up, the DLSSNR readback is top-down. */
++    const int src_y = height - 1 - dst_y;
++    for (int x = 0; x < width; ++x) {
++      const uint16_t *h = reinterpret_cast<const uint16_t *>(bytes + fp_output_.Offset +
++                                                             size_t(fp_output_.Footprint.RowPitch) * src_y +
++                                                             size_t(x) * 8);
++      float r = half_to_float(h[0]);
++      float g = half_to_float(h[1]);
++      float b = half_to_float(h[2]);
++      if (swap_rgb) {
++        std::swap(r, b);
++      }
++      if (clamp_input) {
++        r = std::clamp(r, 0.0f, 1.0f);
++        g = std::clamp(g, 0.0f, 1.0f);
++        b = std::clamp(b, 0.0f, 1.0f);
++      }
++      const Color src = color.load_pixel<Color>(int2(x, dst_y));
++      Color nr(r, g, b, 1.0f);
++      float amount = 1.0f;
++      if (mask != nullptr) {
++        amount = std::clamp(mask->load_pixel<Color>(int2(x, dst_y)).a, 0.0f, 1.0f);
++      }
++      nr.r = src.r + (nr.r - src.r) * amount;
++      nr.g = src.g + (nr.g - src.g) * amount;
++      nr.b = src.b + (nr.b - src.b) * amount;
++      nr.a = src.a;
++      output.store_pixel(int2(x, dst_y), nr);
++    }
++  }
++  readback_->Unmap(0, nullptr);
++}
++
++bool Dx12NR::apply(const Result &color,
++                   const Result *depth,
++                   const Result *motion,
++                   const Result *mask,
++                   const DLSSNRParams &params,
++                   Result &output)
++{
++  if (!color.is_allocated() || color.is_single_value()) {
++    return false;
++  }
++  const int2 size = color.domain().data_size;
++  const int width = size.x;
++  const int height = size.y;
++  if (width < 32 || height < 32) {
++    set_nr_error("DLSSNR requires an input of at least 32x32.");
++    return false;
++  }
++  if (!ensure_device()) {
++    return false;
++  }
++  if (snippet_ == nullptr && !load_modules()) {
++    return false;
++  }
++  if (params_ == nullptr && !alloc_params()) {
++    return false;
++  }
++  if (!ngx_ready_ && !init_ngx_session()) {
++    return false;
++  }
++
++  const bool have_depth = depth != nullptr && depth->is_allocated() && !depth->is_single_value();
++  const bool have_motion = motion != nullptr && motion->is_allocated() &&
++                           !motion->is_single_value();
++  const bool have_mask = mask != nullptr && mask->is_allocated() && !mask->is_single_value();
++
++  if (!ensure_feature(width, height, have_depth, have_motion, params)) {
++    return false;
++  }
++
++  const bool do_reset = params.reset || last_view_key_ != params.view_key;
++  last_view_key_ = params.view_key;
++  has_history_ = !do_reset;
++
++  set_params(width, height, have_depth, have_motion, params, do_reset);
++  stage_inputs(color,
++               have_depth ? depth : nullptr,
++               have_motion ? motion : nullptr,
++               width,
++               height,
++               params.clamp_input);
++  copy_texture_from_upload();
++
++  const NgxResult result = call_eval(snippet_eval_, cmdlist_.Get(), handle_, params_);
++  if (result != kNgxSuccess) {
++    char buffer[128];
++    SNPRINTF(buffer, "EvaluateFeature failed (0x%08x)", unsigned(result));
++    set_nr_error(buffer);
++    return false;
++  }
++  copy_texture_to_readback();
++  execute_and_wait();
++  download_color(output, color, have_mask ? mask : nullptr, width, height, params.clamp_input);
++  return true;
++}
++
++class CompositorDLSSNR {
++ public:
++  static CompositorDLSSNR &instance()
++  {
++    static CompositorDLSSNR singleton;
++    return singleton;
++  }
++
++  bool apply(const Result &color,
++             const Result *depth,
++             const Result *motion,
++             const Result *mask,
++             const DLSSNRParams &params,
++             Result &output)
++  {
++    std::lock_guard<std::mutex> guard{mutex_};
++    return dlssnr_.apply(color, depth, motion, mask, params, output);
++  }
++
++  CompositorDLSSNR(const CompositorDLSSNR &) = delete;
++  CompositorDLSSNR &operator=(const CompositorDLSSNR &) = delete;
++
++ private:
++  CompositorDLSSNR() = default;
++  ~CompositorDLSSNR() = default;
++
++  std::mutex mutex_;
++  Dx12NR dlssnr_;
++};
++
++bool is_dlssnr_available()
++{
++  return !find_nr_runtime_dir().empty();
++}
++
++const char *dlssnr_last_error()
++{
++  return g_last_error;
++}
++
++class ScopedYieldBlenderGPU {
++ public:
++  /* Viewport compositor runs inside DRW_draw_view. Unbinding GHOST there destroys the window
++   * GPU context and the next node's Result* can go null (mute crash in EEVEE viewport). Only
++   * isolate on the compositor job thread. */
++  explicit ScopedYieldBlenderGPU(const bool isolate)
++  {
++    if (!isolate) {
++      return;
++    }
++    ghost_ = GHOST_IContext::getActiveDrawingContext();
++    gpu_ctx_ = GPU_context_active_get();
++    /* Flush and unbind Blender GPU first while the GHOST context is still current. */
++    if (gpu_ctx_ != nullptr) {
++      GPU_context_active_set(nullptr);
++    }
++    /* Drop the native Vulkan/GL context so D3D12/NGX does not share the thread with it. */
++    if (ghost_ != nullptr) {
++      ghost_->releaseDrawingContext();
++    }
++  }
++
++  ~ScopedYieldBlenderGPU()
++  {
++    if (ghost_ != nullptr) {
++      ghost_->activateDrawingContext();
++    }
++    if (gpu_ctx_ != nullptr) {
++      GPU_context_active_set(gpu_ctx_);
++    }
++  }
++
++  ScopedYieldBlenderGPU(const ScopedYieldBlenderGPU &) = delete;
++  ScopedYieldBlenderGPU &operator=(const ScopedYieldBlenderGPU &) = delete;
++
++ private:
++  GPUContext *gpu_ctx_ = nullptr;
++  GHOST_IContext *ghost_ = nullptr;
++};
++
++bool apply_dlssnr(Context &context,
++                  const Result &color,
++                  const Result *depth,
++                  const Result *motion,
++                  const Result *mask,
++                  const Result * /*albedo*/,
++                  const Result * /*normal*/,
++                  const DLSSNRParams &params,
++                  Result &output)
++{
++  if (context.is_canceled()) {
++    return false;
++  }
++  if (!color.is_allocated() || color.is_single_value()) {
++    return false;
++  }
++  if (color.domain().data_size.x < 32 || color.domain().data_size.y < 32) {
++    return false;
++  }
++
++  output.allocate_texture(color.domain(), true, ResultStorageType::CPU);
++  {
++    /* Compositor job thread: isolate D3D12 from Vulkan. Viewport draw: keep GHOST bound. */
++    ScopedYieldBlenderGPU yield_gpu(!context.is_viewport());
++    if (!CompositorDLSSNR::instance().apply(color, depth, motion, mask, params, output)) {
++      return false;
++    }
++  }
++  return !context.is_canceled();
++}
++
++}  // namespace blender::compositor
++
++#endif
+diff --git "a/source/blender/draw/engines/compositor/compositor_engine.cc" "b/source/blender/draw/engines/compositor/compositor_engine.cc"
+index f6fa617..003ff0b 100644
+--- "a/source/blender/draw/engines/compositor/compositor_engine.cc"
++++ "b/source/blender/draw/engines/compositor/compositor_engine.cc"
+@@ -71,7 +71,12 @@ class Context : public compositor::Context {
+     return *scene_;
+   }
+ 
+-  bool use_gpu() const override
++bool use_gpu() const override
++  {
++    return true;
++  }
++
++  bool is_viewport() const override
+   {
+     return true;
+   }
+diff --git "a/source/blender/nodes/composite/CMakeLists.txt" "b/source/blender/nodes/composite/CMakeLists.txt"
+index 16b02f2..cb5bf80 100644
+--- "a/source/blender/nodes/composite/CMakeLists.txt"
++++ "b/source/blender/nodes/composite/CMakeLists.txt"
+@@ -84,6 +84,7 @@ set(SRC
+   nodes/node_composite_mask_to_sdf.cc
+   nodes/node_composite_movie_clip.cc
+   nodes/node_composite_movie_distortion.cc
++  nodes/node_composite_neural.cc
+   nodes/node_composite_normal.cc
+   nodes/node_composite_normalize.cc
+   nodes/node_composite_pixelate.cc
+diff --git "a/source/blender/nodes/composite/nodes/node_composite_neural.cc" "b/source/blender/nodes/composite/nodes/node_composite_neural.cc"
+new file mode 100644
+index 0000000..78b4f5c
+--- /dev/null
++++ "b/source/blender/nodes/composite/nodes/node_composite_neural.cc"
+@@ -0,0 +1,316 @@
++/* SPDX-FileCopyrightText: 2026 Blender Authors
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later */
++
++#include <optional>
++
++#include "BKE_node.hh"
++
++#include "UI_interface_layout.hh"
++#include "UI_resources.hh"
++
++#include "DNA_node_types.h"
++
++#include "GPU_context.hh"
++
++#include "COM_node_operation.hh"
++#include "COM_utilities_dlssnr.hh"
++
++#include "node_composite_util.hh"
++
++namespace blender::nodes::node_composite_neural_cc {
++
++enum CMPNodeNeuralStyle {
++  CMP_NODE_NEURAL_STYLE_DEFAULT = 0,
++  CMP_NODE_NEURAL_STYLE_NATURAL = 1,
++  CMP_NODE_NEURAL_STYLE_CINEMATIC = 2,
++};
++
++static const EnumPropertyItem style_items[] = {
++    {CMP_NODE_NEURAL_STYLE_DEFAULT,
++     "DEFAULT",
++     0,
++     N_("Default"),
++     N_("DLSSNR default appearance")},
++    {CMP_NODE_NEURAL_STYLE_NATURAL,
++     "NATURAL",
++     0,
++     N_("Natural"),
++     N_("Softer, more natural look")},
++    {CMP_NODE_NEURAL_STYLE_CINEMATIC,
++     "CINEMATIC",
++     0,
++     N_("Cinematic"),
++     N_("Higher local contrast and structure")},
++    {0, nullptr, 0, nullptr, nullptr},
++};
++
++static void node_declare(NodeDeclarationBuilder &b)
++{
++  b.use_custom_socket_order();
++  b.allow_any_socket_order();
++  b.add_input<decl::Color>("Image"_ustr)
++      .default_value({1.0f, 1.0f, 1.0f, 1.0f})
++      .hide_value()
++      .structure_type(StructureType::Dynamic);
++  b.add_output<decl::Color>("Image"_ustr)
++      .structure_type(StructureType::Dynamic)
++      .align_with_previous();
++
++  b.add_input<decl::Float>("Depth"_ustr)
++      .default_value(1.0f)
++      .hide_value()
++      .structure_type(StructureType::Dynamic)
++      .description("Linear depth. Improves temporal stability when available");
++  b.add_input<decl::Vector>("Motion"_ustr)
++      .dimensions(2)
++      .default_value({0.0f, 0.0f})
++      .hide_value()
++      .structure_type(StructureType::Dynamic)
++      .description("2D motion vectors in pixels");
++  b.add_input<decl::Float>("Mask"_ustr)
++      .default_value(1.0f)
++      .min(0.0f)
++      .max(1.0f)
++      .hide_value()
++      .structure_type(StructureType::Dynamic)
++      .description("Per-pixel amount. 0 keeps the original pixel");
++  b.add_input<decl::Color>("Albedo"_ustr)
++      .default_value({1.0f, 1.0f, 1.0f, 1.0f})
++      .hide_value()
++      .structure_type(StructureType::Dynamic);
++  b.add_input<decl::Vector>("Normal"_ustr)
++      .default_value({0.0f, 0.0f, 1.0f})
++      .min(-1.0f)
++      .max(1.0f)
++      .hide_value()
++      .structure_type(StructureType::Dynamic);
++
++  b.add_input<decl::Float>("Intensity"_ustr)
++      .default_value(1.0f)
++      .min(0.0f)
++      .max(2.0f)
++      .subtype(PROP_FACTOR)
++      .description("DLSSNR.Intensity");
++  b.add_input<decl::Menu>("Style"_ustr)
++      .default_value(CMP_NODE_NEURAL_STYLE_CINEMATIC)
++      .static_items(style_items)
++      .optional_label()
++      .description("DLSSNR.Style");
++  b.add_input<decl::Float>("Structure"_ustr)
++      .default_value(1.0f)
++      .min(0.0f)
++      .max(2.0f)
++      .subtype(PROP_FACTOR)
++      .description("DLSSNR.LocalStructureStrength");
++  b.add_input<decl::Float>("Tone"_ustr)
++      .default_value(1.0f)
++      .min(0.0f)
++      .max(2.0f)
++      .subtype(PROP_FACTOR)
++      .description("DLSSNR.LocalToneStrength");
++  b.add_input<decl::Float>("Skin"_ustr)
++      .default_value(-1.0f)
++      .min(-1.0f)
++      .max(2.0f)
++      .description("DLSSNR.SkinStructureStrength. -1 disables");
++  b.add_input<decl::Bool>("Auto Mask"_ustr)
++      .default_value(false)
++      .description("DLSSNR.UseAutoMask");
++  b.add_input<decl::Bool>("UI Correction"_ustr)
++      .default_value(false)
++      .description("DLSSNR.UICorrection");
++  b.add_input<decl::Bool>("Clamp"_ustr)
++      .default_value(true)
++      .description("Clamp RGB to 0-1 before NR. Prevents HDR block artifacts");
++  b.add_input<decl::Bool>("Reset"_ustr)
++      .default_value(false)
++      .description(
++          "Force-clear temporal history this eval. History also auto-clears when the "
++          "camera or viewport view changes (same as viewport DLSS)");
++}
++
++static void node_draw_buttons(ui::Layout &layout, bContext * /*C*/, PointerRNA * /*ptr*/)
++{
++#ifdef _WIN32
++  layout.label(RPT_("Viewer / viewport compositor / F12"), ICON_INFO);
++  if (!compositor::is_dlssnr_available()) {
++    layout.label(RPT_(compositor::dlssnr_last_error()), ICON_STATUS_ERROR);
++  }
++#else
++  layout.label(RPT_("Disabled. Built without DLSS"), ICON_STATUS_ERROR);
++#endif
++}
++
++using namespace blender::compositor;
++
++class NeuralOperation : public NodeOperation {
++ public:
++  using NodeOperation::NodeOperation;
++
++  void evaluate_input_processors() override
++  {
++    /* Mute/cancel must not run GPU conversion/realize on this node. D3D12 may have just
++     * yielded the compositor context; processors would then crash in ConversionOperation. */
++    if (this->node().is_muted() || this->context().is_canceled()) {
++      return;
++    }
++    Operation::evaluate_input_processors();
++  }
++
++  void execute() override
++  {
++    const Result &input_image = this->get_input("Image");
++    Result &output_image = this->get_result("Image");
++
++    /* Write the input as the output on all paths that do not produce a neural result, so a muted
++     * or failed pass still shows the (already realized) input image. */
++    auto fallback_to_input = [&]() { output_image.share_data(input_image); };
++
++    if (this->node().is_muted() || input_image.is_single_value() || this->context().is_canceled()) {
++      fallback_to_input();
++      return;
++    }
++
++#ifdef _WIN32
++    if (!is_dlssnr_available()) {
++      this->context().set_info_message(StringRef(dlssnr_last_error()));
++      fallback_to_input();
++      return;
++    }
++
++    std::optional<Result> color_storage;
++    std::optional<Result> depth_storage;
++    std::optional<Result> motion_storage;
++    std::optional<Result> mask_storage;
++    std::optional<Result> albedo_storage;
++    std::optional<Result> normal_storage;
++
++    const Result *color = this->prepare_cpu_input("Image", color_storage);
++    if (color == nullptr || !color->is_allocated()) {
++      fallback_to_input();
++      return;
++    }
++    const Result *depth = this->prepare_cpu_input("Depth", depth_storage);
++    const Result *motion = this->prepare_cpu_input("Motion", motion_storage);
++    const Result *mask = this->prepare_cpu_input("Mask", mask_storage);
++    const Result *albedo = this->prepare_cpu_input("Albedo", albedo_storage);
++    const Result *normal = this->prepare_cpu_input("Normal", normal_storage);
++
++    DLSSNRParams params;
++    params.intensity = this->get_single("Intensity", 1.0f);
++    params.style = this->get_style();
++    params.structure = this->get_single("Structure", 1.0f);
++    params.tone = this->get_single("Tone", 1.0f);
++    params.skin = this->get_single("Skin", -1.0f);
++    params.auto_mask = this->get_single("Auto Mask", false);
++    params.ui_correction = this->get_single("UI Correction", false);
++    params.clamp_input = this->get_single("Clamp", true);
++    params.reset = this->get_single("Reset", false);
++    params.view_key = this->context().temporal_view_key();
++
++    Result output_cpu = this->context().create_result(ResultType::Color);
++    GPUContext *gpu_ctx = GPU_context_active_get();
++    const bool success = apply_dlssnr(
++        this->context(), *color, depth, motion, mask, albedo, normal, params, output_cpu);
++    if (gpu_ctx != nullptr && GPU_context_active_get() != gpu_ctx) {
++      GPU_context_active_set(gpu_ctx);
++    }
++
++    auto release_storage = [](std::optional<Result> &storage) {
++      if (storage.has_value()) {
++        storage->release();
++      }
++    };
++
++    if (!success) {
++      this->context().set_info_message(StringRef(dlssnr_last_error()));
++      fallback_to_input();
++    }
++    else if (this->context().use_gpu()) {
++      Result output_gpu = output_cpu.upload_to_gpu(true);
++      output_image.share_data(output_gpu);
++      output_gpu.release();
++    }
++    else {
++      output_image.share_data(output_cpu);
++    }
++
++    if (output_cpu.is_allocated()) {
++      output_cpu.release();
++    }
++    release_storage(color_storage);
++    release_storage(depth_storage);
++    release_storage(motion_storage);
++    release_storage(mask_storage);
++    release_storage(albedo_storage);
++    release_storage(normal_storage);
++#else
++    fallback_to_input();
++#endif
++  }
++
++  /* If the input is a GPU result in GPU mode, return a CPU copy that is owned by the given storage.
++   * Returns null for unallocated or single value inputs, which the DLSSNR pass treats as absent. */
++  const Result *prepare_cpu_input(const char *identifier, std::optional<Result> &storage)
++  {
++    const Result &input = this->get_input(identifier);
++    if (!input.is_allocated() || input.is_single_value()) {
++      return nullptr;
++    }
++    if (this->context().use_gpu() && input.is_stored_on_gpu()) {
++      storage = input.download_to_cpu();
++      return &*storage;
++    }
++    return &input;
++  }
++
++  template<typename T> T get_single(const char *identifier, const T fallback)
++  {
++    const Result &input = this->get_input(identifier);
++    if (!input.is_allocated() || !input.is_single_value()) {
++      return fallback;
++    }
++    return input.get_single_value<T>();
++  }
++
++  int get_style()
++  {
++    const Result &input = this->get_input("Style");
++    if (!input.is_allocated() || !input.is_single_value()) {
++      return CMP_NODE_NEURAL_STYLE_CINEMATIC;
++    }
++    if (input.type() == ResultType::Menu) {
++      return int(input.get_single_value<MenuValue>().value);
++    }
++    if (input.type() == ResultType::Int) {
++      return input.get_single_value<int>();
++    }
++    return CMP_NODE_NEURAL_STYLE_CINEMATIC;
++  }
++};
++
++static NodeOperation *get_compositor_operation(Context &context, const bNode &node)
++{
++  return new NeuralOperation(context, node);
++}
++
++static void node_register()
++{
++  static bke::bNodeType ntype;
++
++  cmp_node_type_base(&ntype, "CompositorNodeNeural"_ustr, CMP_NODE_NEURAL);
++  ntype.ui_name = "DLSS Neural";
++  ntype.ui_description =
++      "DLSS 5 Neural Rendering (Feature 18). Place nvngx_dlssnr.dll in blender/dlss5/";
++  ntype.enum_name_legacy = "NEURAL";
++  ntype.nclass = NODE_CLASS_OP_FILTER;
++  ntype.declare = node_declare;
++  ntype.draw_buttons = node_draw_buttons;
++  ntype.get_compositor_operation = get_compositor_operation;
++
++  bke::node_register_type(ntype);
++}
++NOD_REGISTER_NODE(node_register)
++
++}  // namespace blender::nodes::node_composite_neural_cc
