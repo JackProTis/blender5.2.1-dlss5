@@ -1,0 +1,110 @@
+# ==============================================================
+# 云构建:Blender 5.2.1 官方源码 + DLSS5 补丁(port.patch)
+# 三步用法(GitHub 网页,不装任何东西):
+#   ① 上传 port.patch 到仓库根目录
+#   ② 新建文件 .github/workflows/build-windows.yml,内容粘贴本文件
+#   ③ Actions → Run workflow → 等 2~4 小时 → Artifacts 下载 DLSS5-exe
+# ==============================================================
+
+name: Build Blender 5.2.1 + DLSS5
+
+on:
+  workflow_dispatch:          # 手动点 Run workflow 触发
+  push:
+    paths:                    # (可选)以后改 workflow 自动跑
+      - 'port.patch'
+      - '.github/workflows/build-windows.yml'
+
+jobs:
+  build_windows:
+    runs-on: windows-2022
+    timeout-minutes: 300
+    env:
+      # 官方 v5.2.1 源码 checkout 到的子目录
+      SRC_DIR: blender-src
+    steps:
+      # --------------------------------------------------------
+      # 1. 检出本仓库(含根目录 port.patch;默认不带补丁自己人用文件)
+      # --------------------------------------------------------
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # --------------------------------------------------------
+      # 2. 检出官方纯 v5.2.1 源码
+      # --------------------------------------------------------
+      - uses: actions/checkout@v4
+        with:
+          repository: blender/blender
+          ref: v5.2.1
+          path: ${{ env.SRC_DIR }}
+          fetch-depth: 1
+
+      # --------------------------------------------------------
+      # 3. 打补丁:port.patch(已验证:8 改 + 3 新 = 11 项)
+      #    路径前缀 a/source/blender/... 正好对应官方源码树根
+      # --------------------------------------------------------
+      - name: Apply DLSS5 patch (port.patch)
+        shell: bash
+        working-directory: ${{ env.SRC_DIR }}
+        run: |
+          if [ ! -f "$GITHUB_WORKSPACE/port.patch" ]; then
+            echo "ERROR: port.patch not found at repo root"; exit 1
+          fi
+          git apply --check "$GITHUB_WORKSPACE/port.patch" || {
+            echo "ERROR: patch ~check~ failed (可能版本不对)"; exit 1; }
+          git apply "$GITHUB_WORKSPACE/port.patch"
+          echo "patch applied OK"
+
+      # --------------------------------------------------------
+      # 4. 装 SVN(Blender 官方依赖库用 SVN 分发)
+      # --------------------------------------------------------
+      - name: Install SVN
+        shell: powershell
+        run: |
+          if (-not (Test-Path "C:\Program Files\SlikSvn\bin\svn.exe")) {
+            choco install svn -y --no-progress
+          }
+          echo "svn ok"
+
+      # --------------------------------------------------------
+      # 5. 拉依赖库(官方脚本 make.bat update,首次约 5~9GB)
+      # --------------------------------------------------------
+      - name: Fetch dependency libraries
+        shell: cmd
+        working-directory: ${{ env.SRC_DIR }}
+        run: |
+          call make.bat update
+
+      # --------------------------------------------------------
+      # 6. 全量编译 Windows Release
+      #    注:make.bat 顶层脚本会顺带做 CMake 配置+MSBuild
+      # --------------------------------------------------------
+      - name: Build Blender (Release)
+        shell: cmd
+        working-directory: ${{ env.SRC_DIR }}
+        run: |
+          call make.bat
+
+      # --------------------------------------------------------
+      # 7. 收集产物:build_windows\bin → zip
+      # --------------------------------------------------------
+      - name: Package Blender build output
+        shell: powershell
+        run: |
+          $bin = Join-Path $env:GITHUB_WORKSPACE "${{ env.SRC_DIR }}\build_windows\bin"
+          if (-not (Test-Path $bin)) {
+            Write-Error "bin not found: $bin"; exit 1
+          }
+          Compress-Archive -Path (Join-Path $bin "*") `
+            -DestinationPath (Join-Path $env:GITHUB_WORKSPACE "DLSS5-exe.zip") -Force
+
+      # --------------------------------------------------------
+      # 8. 上传产物(在 Actions 页底部 Artifacts 下载)
+      # --------------------------------------------------------
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DLSS5-exe
+          path: DLSS5-exe.zip
+          if-no-files-found: error
+          retention-days: 7
