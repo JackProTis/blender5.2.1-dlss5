@@ -79,7 +79,7 @@ jobs:
         shell: powershell
         working-directory: ${{ env.SRC_DIR }}
         run: |
-          cmd /c "call make.bat update"
+          cmd /c "echo y| call make.bat update"
 
       # --------------------------------------------------------
       # 6. 全量编译(Release)
